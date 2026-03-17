@@ -5,14 +5,12 @@ const SUPABASE_URL      = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
 const BASE_URL          = 'https://api.joinhomebase.com';
 
-// Up North excluded — requires All-in-one tier upgrade to access API
 const LOCATIONS = [
   { id: '7a9a7f96-1ec0-4667-9c11-7418a2a85816', name: 'Nikos UAlbany' },
 ];
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
 function getWeekStart(dateStr) {
   const d = new Date(dateStr);
   const day = d.getDay();
@@ -20,8 +18,6 @@ function getWeekStart(dateStr) {
   return d.toISOString().split('T')[0];
 }
 
-// Returns array of {start, end} month chunks covering last 12 months
-// Homebase max range = 1 month per request
 function getMonthChunks() {
   const chunks = [];
   const now = new Date();
@@ -37,8 +33,7 @@ function getMonthChunks() {
 }
 
 async function homebaseFetch(path) {
-  const url = `${BASE_URL}${path}`;
-  const res = await fetch(url, {
+  const res = await fetch(`${BASE_URL}${path}`, {
     headers: {
       'Authorization': `Bearer ${HOMEBASE_API_KEY}`,
       'Accept':        'application/vnd.homebase-v1+json',
@@ -63,51 +58,48 @@ async function fetchAllPages(basePath) {
       : (data.timecards || data.shifts || data.employees || data.data || []);
     if (items.length === 0) break;
     all = all.concat(items);
-    console.log(`    page ${page}: ${items.length} records`);
+    process.stdout.write(` ${items.length}`);
     if (items.length < 100) break;
     page++;
   }
   return all;
 }
 
-// ── SYNC TIMECARDS ────────────────────────────────────────────────────────────
 async function syncTimecards(location) {
-  console.log(`\n[${location.name}] Fetching timecards (12 months, month by month)...`);
+  console.log(`\n[${location.name}] Fetching timecards...`);
   const chunks = getMonthChunks();
   let allTimecards = [];
 
   for (const chunk of chunks) {
-    process.stdout.write(`  ${chunk.start} → ${chunk.end} ... `);
+    process.stdout.write(`  ${chunk.start}:`);
     try {
       const items = await fetchAllPages(
         `/locations/${location.id}/timecards?start_date=${chunk.start}&end_date=${chunk.end}`
       );
-      console.log(`${items.length} records`);
+      console.log(` records`);
       allTimecards = allTimecards.concat(items);
     } catch (err) {
-      console.log(`skipped (${err.message})`);
+      console.log(` skipped (${err.message})`);
     }
   }
 
-  console.log(`\n  Total timecards: ${allTimecards.length}`);
-  if (allTimecards.length === 0) {
-    console.log('  → No timecard data found. Check that timecards exist in Homebase.');
-    return;
-  }
-
-  // Log first record so we can see field names
-  console.log('  → Sample record:', JSON.stringify(allTimecards[0], null, 2));
+  console.log(`\n  Total: ${allTimecards.length} timecards`);
+  if (allTimecards.length === 0) return;
 
   // Group by week + employee + role
   const byWeek = {};
   for (const tc of allTimecards) {
-    const date = tc.date || tc.clock_in_time?.split('T')[0] || tc.created_at?.split('T')[0];
+    // Name is top-level first_name + last_name
+    const employeeName = `${tc.first_name || ''} ${tc.last_name || ''}`.trim() || 'Unknown';
+    const role         = tc.role || 'Staff';
+    const department   = tc.department || '';
+
+    // Date comes from clock_in
+    const date = tc.clock_in?.split('T')[0] || tc.created_at?.split('T')[0];
     if (!date) continue;
 
-    const weekStart    = getWeekStart(date);
-    const employeeName = tc.employee?.name || tc.employee_name || 'Unknown';
-    const role         = tc.job?.name || tc.role || tc.position || 'Staff';
-    const key          = `${weekStart}__${employeeName}__${role}`;
+    const weekStart = getWeekStart(date);
+    const key       = `${weekStart}__${employeeName}__${role}`;
 
     if (!byWeek[key]) {
       byWeek[key] = {
@@ -116,77 +108,73 @@ async function syncTimecards(location) {
         location_name:   location.name,
         employee_name:   employeeName,
         role,
+        department,
         scheduled_hours: 0,
         actual_hours:    0,
         labor_cost:      0,
       };
     }
 
-    const hours = parseFloat(
-      tc.hours_worked ??
-      tc.duration_in_hours ??
-      (tc.duration_in_minutes != null ? tc.duration_in_minutes / 60 : null) ??
-      0
-    );
-    const wages = parseFloat(
-      tc.wages_in_cents != null ? tc.wages_in_cents / 100 :
-      (tc.wages ?? tc.total_pay ?? tc.amount ?? 0)
-    );
-
-    byWeek[key].actual_hours += hours;
-    byWeek[key].labor_cost   += wages;
+    // All the real data is nested inside tc.labor
+    const labor = tc.labor || {};
+    byWeek[key].actual_hours    += parseFloat(labor.regular_hours    || 0);
+    byWeek[key].labor_cost      += parseFloat(labor.costs            || 0);
+    byWeek[key].scheduled_hours += parseFloat(labor.scheduled_hours  || 0);
   }
 
   const rows = Object.values(byWeek);
-  console.log(`\n  Upserting ${rows.length} weekly rows into Supabase...`);
+  console.log(`  Grouped into ${rows.length} weekly rows`);
 
-  // Upsert in batches of 50
+  // Preview first 3 rows so we can verify
+  console.log('\n  Preview (first 3 rows):');
+  rows.slice(0, 3).forEach(r => {
+    console.log(`    ${r.week_start} | ${r.employee_name} | ${r.role} | ${r.actual_hours.toFixed(2)}h | $${r.labor_cost.toFixed(2)}`);
+  });
+
+  console.log(`\n  Inserting into Supabase...`);
   for (let i = 0; i < rows.length; i += 50) {
     const batch = rows.slice(i, i + 50);
-    const { error } = await supabase
-      .from('labor_weekly')
-      .upsert(batch, { ignoreDuplicates: false });
-    if (error) console.error(`  ✗ Batch ${i}-${i+50} error:`, error.message);
-    else console.log(`  ✓ Batch ${i + 1}–${Math.min(i + 50, rows.length)} saved`);
+    const { error } = await supabase.from('labor_weekly').insert(batch);
+    if (error) console.error(`  ✗ Batch ${i+1}–${Math.min(i+50, rows.length)}:`, error.message);
+    else console.log(`  ✓ Batch ${i+1}–${Math.min(i+50, rows.length)} saved`);
   }
 }
 
-// ── SYNC SHIFTS ───────────────────────────────────────────────────────────────
 async function syncShifts(location) {
   console.log(`\n[${location.name}] Fetching shifts (scheduled hours)...`);
   const chunks = getMonthChunks();
   let allShifts = [];
 
   for (const chunk of chunks) {
-    process.stdout.write(`  ${chunk.start} → ${chunk.end} ... `);
+    process.stdout.write(`  ${chunk.start}:`);
     try {
       const items = await fetchAllPages(
         `/locations/${location.id}/shifts?start_date=${chunk.start}&end_date=${chunk.end}`
       );
-      console.log(`${items.length} records`);
+      console.log(` records`);
       allShifts = allShifts.concat(items);
     } catch (err) {
-      console.log(`skipped (${err.message})`);
+      console.log(` skipped (${err.message})`);
     }
   }
 
-  console.log(`\n  Total shifts: ${allShifts.length}`);
+  console.log(`\n  Total: ${allShifts.length} shifts`);
   if (allShifts.length === 0) return;
 
+  // Group scheduled hours by week + employee
   const byWeek = {};
   for (const shift of allShifts) {
-    const date = shift.date || shift.start_time?.split('T')[0];
+    const date = shift.start_time?.split('T')[0] || shift.date;
     if (!date) continue;
     const weekStart    = getWeekStart(date);
-    const employeeName = shift.employee?.name || shift.employee_name || 'Unknown';
-    const key          = `${weekStart}__${employeeName}__${location.id}`;
+    const employeeName = `${shift.first_name || ''} ${shift.last_name || ''}`.trim() ||
+                          shift.employee?.name || 'Unknown';
+    const key = `${weekStart}__${employeeName}__${location.id}`;
     if (!byWeek[key]) byWeek[key] = { weekStart, employeeName, locationId: location.id, hours: 0 };
-    const hours = parseFloat(
-      shift.duration_in_hours ??
-      (shift.duration_in_minutes != null ? shift.duration_in_minutes / 60 : null) ??
-      shift.hours ?? 0
-    );
-    byWeek[key].hours += hours;
+    const duration = shift.duration_in_minutes
+      ? shift.duration_in_minutes / 60
+      : (parseFloat(shift.duration_in_hours || shift.hours || 0));
+    byWeek[key].hours += duration;
   }
 
   let updated = 0;
@@ -202,15 +190,11 @@ async function syncShifts(location) {
   console.log(`  ✓ Scheduled hours updated for ${updated} rows`);
 }
 
-// ── MAIN ──────────────────────────────────────────────────────────────────────
 async function main() {
   console.log('=== Nikos Ops — Homebase Sync ===\n');
-
   if (!HOMEBASE_API_KEY || !SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    console.error('✗ Missing env variables. Check .env file.');
-    process.exit(1);
+    console.error('✗ Missing env variables.'); process.exit(1);
   }
-
   for (const location of LOCATIONS) {
     try {
       await syncTimecards(location);
@@ -219,8 +203,7 @@ async function main() {
       console.error(`\n✗ Fatal error for ${location.name}:`, err.message);
     }
   }
-
-  console.log('\n=== Sync complete — check Supabase Table Editor → labor_weekly ===');
+  console.log('\n=== Sync complete ===');
 }
 
 main();
