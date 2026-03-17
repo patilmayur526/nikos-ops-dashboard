@@ -21,7 +21,7 @@ function getWeekStart(dateStr) {
 function getMonthChunks() {
   const chunks = [];
   const now = new Date();
-  for (let i = 11; i >= 0; i--) {
+  for (let i = 35; i >= 0; i--) {
     const start = new Date(now.getFullYear(), now.getMonth() - i, 1);
     const end   = new Date(now.getFullYear(), now.getMonth() - i + 1, 0);
     chunks.push({
