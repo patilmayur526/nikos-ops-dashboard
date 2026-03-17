@@ -28,9 +28,9 @@ async function main() {
   console.log(`Parsed ${daily.length} daily rows`);
   console.log(`Date range: ${daily[0].date} → ${daily[daily.length-1].date}`);
 
-  // Map to sales_daily schema
+  // Map to sales_daily schema — using 'date' column name
   const rows = daily.map(r => ({
-    week_start:    r.date,          // renamed col — stores the actual date
+    date:          r.date,
     location_id:   LOCATION_ID,
     location_name: LOCATION_NAME,
     gross_sales:   parseFloat(r.gross_sales || 0),
@@ -41,14 +41,10 @@ async function main() {
   // Preview
   console.log('\nSample rows:');
   rows.filter(r => r.net_sales > 0).slice(0, 5).forEach(r =>
-    console.log(`  ${r.week_start} | Net: $${r.net_sales} | Gross: $${r.gross_sales} | Checks: ${r.covers}`)
-  );
-  console.log('\nZero days sample:');
-  rows.filter(r => r.net_sales === 0).slice(0, 3).forEach(r =>
-    console.log(`  ${r.week_start} | $0 — closed/prep day`)
+    console.log(`  ${r.date} | Net: $${r.net_sales} | Gross: $${r.gross_sales} | Checks: ${r.covers}`)
   );
 
-  // Clear old weekly data first
+  // Clear old data
   console.log('\nClearing old sales_daily data...');
   const { error: delError } = await supabase
     .from('sales_daily')
@@ -59,11 +55,17 @@ async function main() {
 
   // Insert in batches
   console.log('\nInserting into sales_daily...');
+  let success = 0;
   for (let i = 0; i < rows.length; i += 50) {
     const batch = rows.slice(i, i + 50);
     const { error } = await supabase.from('sales_daily').insert(batch);
     if (error) console.error(`  ✗ Batch ${i+1}–${Math.min(i+50, rows.length)}:`, error.message);
-    else console.log(`  ✓ Batch ${i+1}–${Math.min(i+50, rows.length)} saved`);
+    else { console.log(`  ✓ Batch ${i+1}–${Math.min(i+50, rows.length)} saved`); success++; }
+  }
+
+  if (success === 0) {
+    console.error('\n✗ No data inserted. Check column names in Supabase Table Editor.');
+    process.exit(1);
   }
 
   // Verify via weekly view
@@ -76,14 +78,13 @@ async function main() {
   if (viewError) {
     console.error('  ✗ View error:', viewError.message);
   } else {
-    console.log(`  ✓ ${weekly.length} weeks visible in sales_weekly view`);
+    console.log(`  ✓ ${weekly.length} weeks in sales_weekly view`);
     console.log('\n  Top 5 weeks by net sales:');
     [...weekly]
       .sort((a, b) => b.net_sales - a.net_sales)
       .slice(0, 5)
       .forEach(w => console.log(
-        `    ${w.week_start} | Net: $${parseFloat(w.net_sales).toFixed(2)} | ` +
-        `Checks: ${w.covers} | Open days: ${w.open_days}`
+        `    ${w.week_start} | Net: $${parseFloat(w.net_sales).toFixed(2)} | Checks: ${w.covers} | Open days: ${w.open_days}`
       ));
   }
 
